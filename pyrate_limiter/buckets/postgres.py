@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Awaitable, List, Optional, Union
 
 from ..abstracts import AbstractBucket, Rate, RateItem
+from ..abstracts.algorithm import Decision
 from ..clocks import PostgresClock
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,9 @@ class PostgresBucket(AbstractBucket):
                 conn.execute(self._q_lock)
             except LockNotAvailable:
                 logger.debug("LockNotAvailable")
-                self.failing_rate = self.rates[0]
+                # Contention, not a full window: there is no meaningful
+                # retry-after to record, so waiting() falls back to deriving one.
+                self._record(item, Decision(failing_rate=self.rates[0]))
                 return False
 
             params = [v for rate in self.rates for v in (item_ts_seconds, rate.interval)]
@@ -152,12 +155,25 @@ class PostgresBucket(AbstractBucket):
             counts = cur.fetchone()
             cur.close()
 
-            decision = self._algorithm.admit(self.rates, counts, item.weight)
-            if not decision.allowed:
-                self.failing_rate = decision.failing_rate
-                return False
+            def peek_timestamp(offset: int) -> Optional[int]:
+                # Runs inside the EXCLUSIVE table lock, so the retry-after
+                # describes exactly the state the verdict was made against.
+                peek_cur = conn.execute(self._q_peek, (offset,))
+                peek_row = peek_cur.fetchone()
+                peek_cur.close()
 
-            self.failing_rate = None
+                return None if peek_row is None else int(peek_row[2])
+
+            decision = self._algorithm.decide(
+                self.rates,
+                counts,
+                item.weight,
+                item.timestamp,
+                peek_timestamp,
+            )
+
+            if not self._record(item, decision):
+                return False
             # Insert all `weight` unit-rows in a single statement (one round
             # trip) instead of `weight` separate INSERTs under the table lock.
             conn.execute(self._q_put, (item.name, item.weight, item_ts_seconds, item.weight))
@@ -195,6 +211,7 @@ class PostgresBucket(AbstractBucket):
         with self._get_conn() as conn:
             conn.execute(self._q_flush)
             self.failing_rate = None
+            self._last_wait = None
 
         return None
 
