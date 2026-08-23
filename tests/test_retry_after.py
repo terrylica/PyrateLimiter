@@ -281,3 +281,56 @@ def test_put_decision_reports_unknown_wait_for_a_legacy_bucket():
     assert not decision.allowed
     assert decision.retry_after_ms is None  # "ask waiting()", not "no wait"
     assert bucket.waiting(RateItem("a", 1200)) == 801
+
+
+# ------------------------------------------------------- redis lua sentinels
+
+class StubRedis:
+    """Returns a canned `evalsha` reply, to pin the sentinel mapping."""
+
+    def __init__(self, reply):
+        self.reply = reply
+
+    def evalsha(self, *_args, **_kwargs):
+        return self.reply
+
+
+def _redis_bucket(reply, rates):
+    from pyrate_limiter import RedisBucket
+
+    return RedisBucket(rates, StubRedis(reply), "stub-key", "stub-hash")
+
+
+def test_redis_sentinel_never_fits():
+    rates = [Rate(3, 1000)]
+    bucket = _redis_bucket([0, -1], rates)
+
+    item = RateItem("a", 1000, weight=9)
+    assert bucket.put(item) is False
+    assert bucket.failing_rate is rates[0]
+    assert bucket._last_wait is None
+    assert bucket.waiting(item) == -1
+
+
+def test_redis_sentinel_no_blocking_item():
+    """-2 must not read as "never fits": it means already ready, wait 0."""
+    rates = [Rate(3, 1000)]
+    bucket = _redis_bucket([0, -2], rates)
+
+    item = RateItem("a", 1000, weight=1)
+    assert bucket.put(item) is False
+    assert bucket.failing_rate is rates[0]
+    assert bucket.waiting(item) == 0
+
+    decision = bucket.put_decision(RateItem("a", 1000, weight=1))
+    assert isinstance(decision, Decision)
+    assert decision.retry_after_ms == 0
+
+
+def test_redis_blocking_timestamp_becomes_a_wait():
+    rates = [Rate(3, 1000)]
+    bucket = _redis_bucket([0, 700], rates)
+
+    item = RateItem("a", 1200, weight=1)
+    assert bucket.put(item) is False
+    assert bucket.waiting(item) == 700 + 1000 - 1200 + 1

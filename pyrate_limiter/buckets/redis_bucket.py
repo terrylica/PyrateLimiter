@@ -15,6 +15,11 @@ if TYPE_CHECKING:
     from redis.asyncio import Redis as AsyncRedis
 
 
+# Sentinels PUT_ITEM returns in place of a blocking timestamp.
+NEVER_FITS = -1  # weight exceeds the rate's limit; nothing can make room
+NO_BLOCKING_ITEM = -2  # window full but no item to wait on; already ready
+
+
 class LuaScript:
     """Scripts that deal with bucket operations"""
 
@@ -32,12 +37,15 @@ class LuaScript:
         local count = redis.call('ZCOUNT', bucket, now - interval, now)
         local space_available = limit - tonumber(count)
         if space_available < space_required then
-            -- Blocking item sits `limit - space_required` places from the
-            -- newest. Negative rank = weight can never fit; -1 means no wait.
-            local blocking_timestamp = -1
+            -- Blocking item sits `limit - space_required` places from the newest.
+            -- Denial implies count > rank, so the ZRANGE cannot come back empty;
+            -- -2 keeps that case distinguishable from -1 rather than silently
+            -- reading as "never fits".
             local rank = limit - space_required
+            local blocking_timestamp = -1
 
             if rank >= 0 then
+                blocking_timestamp = -2
                 local blocking = redis.call('ZRANGE', bucket, -1 - rank, -1 - rank, 'WITHSCORES')
                 if blocking[2] then
                     blocking_timestamp = tonumber(blocking[2])
@@ -148,9 +156,13 @@ class RedisBucket(AbstractBucket):
 
             rate = self.rates[idx]
 
-            if blocking_timestamp < 0:
-                # Weight exceeds the limit; waiting() reports -1.
+            if blocking_timestamp == NEVER_FITS:
+                # waiting() reports -1 and the limiter gives up.
                 return Decision(failing_rate=rate)
+
+            if blocking_timestamp == NO_BLOCKING_ITEM:
+                # Match LogAlgorithm.decide()'s peek_timestamp -> None mapping.
+                return Decision(failing_rate=rate, retry_after_ms=0)
 
             return Decision(
                 failing_rate=rate,
