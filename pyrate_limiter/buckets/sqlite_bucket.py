@@ -141,11 +141,10 @@ class SQLiteBucket(AbstractBucket):
             return True
 
     def _peek_timestamp(self, offset: int) -> Optional[int]:
-        """Timestamp of the item ``offset`` places from the newest, or ``None``.
+        """Timestamp ``offset`` places from the newest item, or ``None``.
 
-        Only called on the deny path, and always from inside put()'s lock hold,
-        so the retry-after describes the same rows the verdict was made against
-        - the background Leaker cannot delete any in between.
+        Called from inside put()'s lock hold, so the Leaker cannot delete rows
+        between the verdict and the wait.
         """
         cur = self.conn.execute(Queries.PEEK.format(table=self.table, count=offset))
         row = cur.fetchone()

@@ -1,10 +1,4 @@
-"""Retry-after carried on `Decision` (Phase A).
-
-`put()` now records the wait alongside the verdict, so `waiting()` can answer
-without a second lookup into storage. These tests pin the recorded value to the
-pre-4.5 derivation it replaces, check that the fallback still works for buckets
-that record nothing, and cover the cases where a recorded wait must be ignored.
-"""
+"""Retry-after carried on `Decision`: recorded by put(), read by waiting()."""
 from typing import List, Optional
 
 import pytest
@@ -14,12 +8,7 @@ from pyrate_limiter.abstracts.algorithm import ADMITTED, SlidingWindowLog
 
 
 def legacy_waiting(bucket, item: RateItem) -> int:
-    """The pre-4.5 derivation of the wait, kept here as the reference.
-
-    Looks up the item that must expire first and measures it against the
-    window's inclusive lower bound. `waiting()` no longer computes this on the
-    happy path, so it is reproduced verbatim to cross-check what put() records.
-    """
+    """The pre-4.5 derivation, kept as the reference to cross-check against."""
     rate = bucket.failing_rate
 
     if rate is None:
@@ -58,8 +47,6 @@ def test_decision_carries_retry_after():
 def test_blocking_offset_and_retry_after():
     algo = SlidingWindowLog()
     rate = Rate(5, 1000)
-    # Freeing room for `weight` means waiting on the item `limit - weight`
-    # places from the newest.
     assert algo.blocking_offset(rate, 1) == 4
     assert algo.blocking_offset(rate, 5) == 0
     # +1 clears the inclusive lower bound.
@@ -87,7 +74,7 @@ def test_decide_skips_lookup_when_weight_can_never_fit():
 
     decision = algo.decide(rates, [0], weight=4, now=1000, peek_timestamp=boom)
     assert not decision.allowed
-    # None, not 0: waiting() reports -1 for a weight that exceeds the limit.
+    # None, not 0: waiting() reports -1 for a weight over the limit.
     assert decision.retry_after_ms is None
 
 
@@ -169,15 +156,14 @@ def test_recorded_wait_is_not_reused_for_a_different_weight():
     assert bucket.put(light) is False
     assert bucket.waiting(light) == 1000 + 1000 - 1300 + 1  # 701
 
-    # A heavier item must wait on a *different* stored item, so the recording
-    # made for weight 1 has to be ignored rather than reused.
+    # A heavier item waits on a different stored item.
     heavy = RateItem("a", 1300, weight=2)
     assert bucket.waiting(heavy) == 1100 + 1000 - 1300 + 1  # 801
     assert bucket.waiting(heavy) == legacy_waiting(bucket, heavy)
 
 
 def test_recorded_wait_survives_a_later_query_timestamp():
-    """The recording is an absolute instant, so a later query shrinks the wait."""
+    """Recorded as an absolute instant, so a later query shrinks the wait."""
     bucket = InMemoryBucket([Rate(1, 1000)])
     assert bucket.put(RateItem("a", 1000)) is True
 
@@ -232,11 +218,22 @@ def test_put_decision_for_a_weightless_item():
     assert bucket.put(RateItem("a", 1000)) is True
     assert bucket.put(RateItem("a", 1000)) is False
 
-    # A weightless item is always admitted, so it must not inherit the standing
-    # denial left behind by the previous put.
     decision = bucket.put_decision(RateItem("a", 1000, weight=0))
     assert isinstance(decision, Decision)
     assert decision.allowed
+
+
+def test_weightless_put_clears_a_standing_denial():
+    """A trivial admit still records: the previous denial must not survive it."""
+    bucket = InMemoryBucket([Rate(1, 1000)])
+    assert bucket.put(RateItem("a", 1000)) is True
+    assert bucket.put(RateItem("a", 1000)) is False
+    assert bucket.failing_rate is not None
+    assert bucket._last_wait is not None
+
+    assert bucket.put(RateItem("a", 1000, weight=0)) is True
+    assert bucket.failing_rate is None
+    assert bucket._last_wait is None
 
 
 def test_put_decision_reports_no_wait_for_an_impossible_weight():
@@ -254,12 +251,10 @@ def test_put_decision_reports_no_wait_for_an_impossible_weight():
 # ------------------------------------------------- fallback for custom buckets
 
 class LegacyBucket(InMemoryBucket):
-    """A bucket written against the pre-4.5 contract: sets `failing_rate` on
-    denial and records no retry-after."""
+    """Pre-4.5 contract: sets `failing_rate`, records no retry-after."""
 
     def put(self, item: RateItem) -> bool:
         admitted = super().put(item)
-        # Drop the recording, keeping only the old side-channel.
         self._last_wait = None
         return admitted
 

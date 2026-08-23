@@ -32,11 +32,8 @@ class LuaScript:
         local count = redis.call('ZCOUNT', bucket, now - interval, now)
         local space_available = limit - tonumber(count)
         if space_available < space_required then
-            -- Resolve the retry-after in the same atomic script as the verdict.
-            -- The item that has to expire first sits `limit - space_required`
-            -- places from the newest; a negative rank means the weight can never
-            -- fit under this rate, and -1 tells the caller there is no wait to
-            -- report.
+            -- Blocking item sits `limit - space_required` places from the
+            -- newest. Negative rank = weight can never fit; -1 means no wait.
             local blocking_timestamp = -1
             local rank = limit - space_required
 
@@ -125,12 +122,10 @@ class RedisBucket(AbstractBucket):
         return cls(rates, redis, bucket_key, script_hash)
 
     def _check_and_insert(self, item: RateItem) -> Union[Decision, Awaitable[Decision]]:
-        """Run the check-and-insert script, returning the full verdict.
+        """Check-and-insert, returning the full verdict.
 
-        The script reports both the failing rate index and the timestamp of the
-        item blocking it, so the retry-after comes back from the same atomic
-        evaluation as the decision - no second ZRANGE round trip, and no window
-        for the sorted set to move in between.
+        The script returns the blocking timestamp alongside the failing rate, so
+        the wait comes from the same atomic evaluation - no second ZRANGE.
         """
         keys = [self.bucket_key]
 
@@ -154,8 +149,7 @@ class RedisBucket(AbstractBucket):
             rate = self.rates[idx]
 
             if blocking_timestamp < 0:
-                # The weight exceeds this rate's limit, so nothing expiring can
-                # ever make room; waiting() reports -1 from the weight check.
+                # Weight exceeds the limit; waiting() reports -1.
                 return Decision(failing_rate=rate)
 
             return Decision(

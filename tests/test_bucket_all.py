@@ -195,14 +195,11 @@ async def test_bucket_waiting(create_bucket):
 
 @pytest.mark.asyncio
 async def test_bucket_records_retry_after(create_bucket):
-    """Every backend must record the wait on put(), and it must agree with the
-    value derived from storage - the fallback `waiting()` uses for buckets that
-    record nothing."""
+    """put() records the wait, and it agrees with deriving it from storage."""
     rates = [Rate(3, 1000)]
     bucket = BucketAsyncWrapper(await create_bucket(rates))
 
     async def derived_wait(item: RateItem) -> int:
-        """The pre-4.5 derivation, recomputed straight from storage."""
         rate = bucket.failing_rate
         assert rate is not None
         bound = await bucket.peek(rate.limit - item.weight)
@@ -220,13 +217,11 @@ async def test_bucket_records_retry_after(create_bucket):
     blocked = RateItem("item", now + 30)
     assert await bucket.put(blocked) is False
 
-    # put() recorded a wait...
     decision = await bucket.put_decision(RateItem("item", now + 30))
     assert decision.failing_rate == rates[0]
     assert decision.retry_after_ms is not None
     assert decision.retry_after_ms > 0
 
-    # ...and it matches what deriving from storage would have produced.
     assert await bucket.waiting(blocked) == await derived_wait(blocked)
 
     # A successful put clears the standing denial on every backend.

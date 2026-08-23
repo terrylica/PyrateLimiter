@@ -40,7 +40,8 @@ class InMemoryBucket(AbstractBucket):
 
     def put(self, item: RateItem) -> bool:
         if item.weight == 0:
-            return True
+            with self._lock:
+                return self._record(item, ADMITTED)
 
         with self._lock:
             # In-memory native implementation of the SlidingWindowLog policy
@@ -63,10 +64,8 @@ class InMemoryBucket(AbstractBucket):
                 space_available = rate.limit - count_existing_items
 
                 if space_available < item.weight:
-                    # Denied. The item that has to expire first is a constant
-                    # offset from the newest one, so the retry-after falls out
-                    # of the bisect already done here - record it with the
-                    # verdict rather than making waiting() peek again.
+                    # The blocking item is a fixed offset from the newest, so
+                    # the wait falls out of the bisect already done here.
                     offset = self._algorithm.blocking_offset(rate, item.weight)
                     blocking_idx = current_length - 1 - offset
                     retry_after = None

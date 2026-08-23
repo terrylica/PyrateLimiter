@@ -27,18 +27,11 @@ class AbstractBucket(ABC):
     _rates: List[Rate]
     failing_rate: Optional[Rate] = None
     _clock: AbstractClock = MonotonicClock()
-    # The rate-limiting policy this bucket enforces. Internal in v4 (every
-    # bucket uses the sliding-window-log default and delegates its per-rate
-    # admit decision, retry-after and leak bound to it); v5 makes this a
-    # constructor argument so algorithms (GCRA, sliding-window-counter) become
-    # pluggable.
+    # Internal in v4; v5 makes this a constructor argument so algorithms
+    # (GCRA, sliding-window-counter) become pluggable.
     _algorithm: LogAlgorithm = SlidingWindowLog()
-    # Retry-after recorded by the most recent put(), as
-    # ``(weight, absolute_timestamp_at_which_that_weight_fits)``. Kept as an
-    # absolute instant rather than a delay so it stays correct when waiting() is
-    # called with a later timestamp than the put it describes. Every put()
-    # rewrites it and waiting() ignores it unless the weight matches, so a
-    # recorded wait cannot go stale behind a caller's back.
+    # (weight, absolute timestamp at which that weight fits), from the last
+    # put(). Absolute rather than a delay so it survives a later waiting() call.
     _last_wait: Optional[Tuple[int, int]] = None
     # Whether this bucket's operations return awaitables. ``None`` means
     # "unknown" - the Leaker then probes once by calling ``leak(0)`` and
@@ -74,12 +67,10 @@ class AbstractBucket(ABC):
         return self._clock.now()
 
     def _record(self, item: RateItem, decision: Decision) -> bool:
-        """Store a put()'s verdict, and report whether the item was admitted.
+        """Store a put()'s verdict; return whether it was admitted.
 
-        Concrete ``put()`` implementations should funnel their result through
-        here so ``failing_rate`` and the recorded retry-after are always written
-        together. A bucket that sets one without the other can later report a
-        wait that was computed for a different attempt.
+        Every put() path must funnel through here - including trivial admits -
+        so a previous denial can never stay visible.
         """
         self.failing_rate = decision.failing_rate
 
@@ -91,8 +82,7 @@ class AbstractBucket(ABC):
         return decision.allowed
 
     def _recorded_wait(self, item: RateItem) -> Optional[int]:
-        """The retry-after recorded by the last put(), if it was for this same
-        weight; ``None`` when there is nothing usable to reuse."""
+        """Last put()'s retry-after, if it was for this same weight."""
         recorded = self._last_wait
 
         if recorded is None or recorded[0] != item.weight:
@@ -107,16 +97,10 @@ class AbstractBucket(ABC):
         """
 
     def put_decision(self, item: RateItem) -> Union[Decision, Awaitable[Decision]]:
-        """``put()``, returning the full ``Decision`` instead of a bare bool.
+        """``put()``, returning the full ``Decision`` rather than a bare bool.
 
-        This is the forward-compatible way to read a put's outcome: the verdict
-        and the retry-after arrive together, rather than the caller reading the
-        ``failing_rate`` attribute and then calling ``waiting()`` separately.
-        Buckets need not override it - the default reads back what ``put()``
-        recorded.
-
-        ``Decision.retry_after_ms`` is ``None`` for a custom bucket that records
-        no retry-after; call ``waiting()`` for those.
+        Buckets need not override it; the default reads back what ``put()``
+        recorded. ``retry_after_ms`` is ``None`` for buckets that record none.
         """
         result = self.put(item)
 
@@ -175,10 +159,8 @@ class AbstractBucket(ABC):
         if recorded is not None:
             return recorded
 
-        # Fallback for buckets that do not record a decision on put() - custom
-        # backends written against the pre-4.5 contract. Derives the wait by
-        # looking up the item that has to expire first, which costs an extra
-        # round trip and reads storage that may have moved since the put.
+        # Fallback for buckets written against the pre-4.5 contract, which
+        # record nothing: derive the wait with an extra lookup.
         bound_item = self.peek(self._algorithm.blocking_offset(self.failing_rate, item.weight))
 
         if bound_item is None:

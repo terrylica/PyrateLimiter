@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Awaitable, List, Optional, Union
 
 from ..abstracts import AbstractBucket, Rate, RateItem
-from ..abstracts.algorithm import Decision
+from ..abstracts.algorithm import ADMITTED, Decision
 from ..clocks import PostgresClock
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ class PostgresBucket(AbstractBucket):
         from psycopg.errors import LockNotAvailable
 
         if item.weight == 0:
-            return True
+            return self._record(item, ADMITTED)
 
         item_ts_seconds = item.timestamp / 1000
 
@@ -145,8 +145,7 @@ class PostgresBucket(AbstractBucket):
                 conn.execute(self._q_lock)
             except LockNotAvailable:
                 logger.debug("LockNotAvailable")
-                # Contention, not a full window: there is no meaningful
-                # retry-after to record, so waiting() falls back to deriving one.
+                # Contention, not a full window - no meaningful wait to record.
                 self._record(item, Decision(failing_rate=self.rates[0]))
                 return False
 
@@ -156,8 +155,7 @@ class PostgresBucket(AbstractBucket):
             cur.close()
 
             def peek_timestamp(offset: int) -> Optional[int]:
-                # Runs inside the EXCLUSIVE table lock, so the retry-after
-                # describes exactly the state the verdict was made against.
+                # Inside the EXCLUSIVE lock: same state the verdict saw.
                 peek_cur = conn.execute(self._q_peek, (offset,))
                 peek_row = peek_cur.fetchone()
                 peek_cur.close()

@@ -79,8 +79,8 @@ class BucketAsyncWrapper(AbstractBucket):
 
     @property
     def _last_wait(self):
-        # waiting() is inherited from AbstractBucket and reads these off `self`;
-        # delegate so it sees what the *wrapped* bucket recorded on put().
+        # Inherited waiting() reads these off `self`; point them at the wrapped
+        # bucket, which is what actually records on put().
         return self.bucket._last_wait
 
     @property
