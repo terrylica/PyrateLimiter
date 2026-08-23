@@ -78,6 +78,16 @@ class BucketAsyncWrapper(AbstractBucket):
         return self.bucket.failing_rate
 
     @property
+    def _last_wait(self):
+        # Inherited waiting() reads these off `self`; point them at the wrapped
+        # bucket, which is what actually records on put().
+        return self.bucket._last_wait
+
+    @property
+    def _algorithm(self):
+        return self.bucket._algorithm
+
+    @property
     def rates(self):
         return self.bucket.rates
 

@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [Unreleased]
+
+Groundwork for pluggable algorithms. Additive — no breaking public API changes.
+
+### Added
+- `Decision` now carries `retry_after_ms` alongside the verdict, and `put()`
+  records it. `AbstractBucket.waiting()` reads that recording instead of
+  deriving the wait from storage a second time. Custom buckets that record
+  nothing keep working: `waiting()` falls back to the previous `peek()`-based
+  derivation.
+- `AbstractBucket.put_decision()` returns the full `Decision` for a put, so the
+  verdict and the retry-after arrive together rather than via the
+  `failing_rate` attribute plus a follow-up `waiting()` call.
+- `Algorithm`, `LogAlgorithm`, `Decision` and `SlidingWindowLog` are exported
+  from the package root.
+
+### Fixed
+- **SQLiteBucket**: a successful `put()` now clears `failing_rate`. Every other
+  backend already did; SQLite left the last denial standing indefinitely.
+
+### Performance
+- **RedisBucket**: the Lua script returns the blocking item's timestamp with the
+  verdict, so a rate-limited request no longer needs a second `ZRANGE` round
+  trip to learn how long to wait — and the wait can no longer be computed
+  against a sorted set that moved in between.
+- **PostgresBucket**: the retry-after is resolved inside the same `EXCLUSIVE`
+  table lock as the check, removing both a round trip and that same race.
+- **SQLiteBucket**: likewise resolved inside `put()`'s existing lock hold, so
+  the background `Leaker` cannot delete rows between the verdict and the wait.
+- **InMemoryBucket** / **MultiprocessBucket**: the wait falls out of the bisect
+  `put()` already performs — no second scan, and no allocation on the admit path.
+
+### Internal / Refactor
+- Split `LogAlgorithm` out of `Algorithm` for policies whose state is a log of
+  timestamped items. `leak_bound()` and the new `blocking_offset()` /
+  `retry_after()` hooks live there; constant-state policies (token bucket, GCRA)
+  will not implement it.
+- The inclusive-window `+1` boundary correction now lives in exactly one place
+  (`SlidingWindowLog.retry_after`) instead of being inlined in `waiting()`.
+
 ## [4.4.0]
 
 Bug-fix, scalability, and internal-refactor release. No public API changes

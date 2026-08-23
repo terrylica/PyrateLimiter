@@ -8,11 +8,11 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from inspect import isawaitable, iscoroutine
 from threading import Event, Thread
-from typing import Any, Awaitable, Dict, List, Optional, Type, Union
+from typing import Any, Awaitable, Dict, List, Optional, Tuple, Type, Union
 
 from ..clocks import AbstractClock, MonotonicClock
 from ..utils import enforce_rate_list
-from .algorithm import Algorithm, SlidingWindowLog
+from .algorithm import Decision, LogAlgorithm, SlidingWindowLog
 from .rate import Rate, RateItem
 
 logger = logging.getLogger("pyrate_limiter")
@@ -27,11 +27,12 @@ class AbstractBucket(ABC):
     _rates: List[Rate]
     failing_rate: Optional[Rate] = None
     _clock: AbstractClock = MonotonicClock()
-    # The rate-limiting policy this bucket enforces. Internal in v4 (every
-    # bucket uses the sliding-window-log default and delegates its per-rate
-    # admit decision + leak bound to it); v5 makes this a constructor argument
-    # so algorithms (GCRA, sliding-window-counter) become pluggable.
-    _algorithm: Algorithm = SlidingWindowLog()
+    # Internal in v4; v5 makes this a constructor argument so algorithms
+    # (GCRA, sliding-window-counter) become pluggable.
+    _algorithm: LogAlgorithm = SlidingWindowLog()
+    # (weight, absolute timestamp at which that weight fits), from the last
+    # put(). Absolute rather than a delay so it survives a later waiting() call.
+    _last_wait: Optional[Tuple[int, int]] = None
     # Whether this bucket's operations return awaitables. ``None`` means
     # "unknown" - the Leaker then probes once by calling ``leak(0)`` and
     # checking for a coroutine. Built-in sync/async buckets declare this so no
@@ -65,11 +66,59 @@ class AbstractBucket(ABC):
         """Retrieve current timestamp from the clock backend."""
         return self._clock.now()
 
+    def _record(self, item: RateItem, decision: Decision) -> bool:
+        """Store a put()'s verdict; return whether it was admitted.
+
+        Every put() path must funnel through here - including trivial admits -
+        so a previous denial can never stay visible.
+        """
+        self.failing_rate = decision.failing_rate
+
+        if decision.retry_after_ms is None:
+            self._last_wait = None
+        else:
+            self._last_wait = (item.weight, item.timestamp + decision.retry_after_ms)
+
+        return decision.allowed
+
+    def _recorded_wait(self, item: RateItem) -> Optional[int]:
+        """Last put()'s retry-after, if it was for this same weight."""
+        recorded = self._last_wait
+
+        if recorded is None or recorded[0] != item.weight:
+            return None
+
+        return max(0, recorded[1] - item.timestamp)
+
     @abstractmethod
     def put(self, item: RateItem) -> Union[bool, Awaitable[bool]]:
         """Put an item (typically the current time) in the bucket
         return true if successful, otherwise false
         """
+
+    def put_decision(self, item: RateItem) -> Union[Decision, Awaitable[Decision]]:
+        """``put()``, returning the full ``Decision`` rather than a bare bool.
+
+        Buckets need not override it; the default reads back what ``put()``
+        recorded. ``retry_after_ms`` is ``None`` for buckets that record none.
+        """
+        result = self.put(item)
+
+        if isawaitable(result):
+
+            async def _await_decision() -> Decision:
+                await result
+                return self._decision(item)
+
+            return _await_decision()
+
+        return self._decision(item)
+
+    def _decision(self, item: RateItem) -> Decision:
+        if item.weight == 0 or self.failing_rate is None:
+            return Decision()
+
+        return Decision(failing_rate=self.failing_rate, retry_after_ms=self._recorded_wait(item))
 
     @abstractmethod
     def leak(
@@ -105,7 +154,14 @@ class AbstractBucket(ABC):
         if item.weight > self.failing_rate.limit:
             return -1
 
-        bound_item = self.peek(self.failing_rate.limit - item.weight)
+        recorded = self._recorded_wait(item)
+
+        if recorded is not None:
+            return recorded
+
+        # Fallback for buckets written against the pre-4.5 contract, which
+        # record nothing: derive the wait with an extra lookup.
+        bound_item = self.peek(self._algorithm.blocking_offset(self.failing_rate, item.weight))
 
         if bound_item is None:
             # NOTE: No waiting, bucket is immediately ready
@@ -113,14 +169,7 @@ class AbstractBucket(ABC):
 
         def _calc_waiting(inner_bound_item: RateItem) -> int:
             assert self.failing_rate is not None  # NOTE: silence mypy
-            lower_time_bound = item.timestamp - self.failing_rate.interval
-            upper_time_bound = inner_bound_item.timestamp
-            # +1: the window lower bound is inclusive across all backends (an
-            # item counts while timestamp >= now - interval). Returning the bare
-            # difference lands the retry exactly ON the boundary, where the item
-            # is still counted, so the re-put fails and waiting() then returns 0
-            # -> _delay_waiter busy-spins. One extra ms pushes strictly past it.
-            return upper_time_bound - lower_time_bound + 1
+            return self._algorithm.retry_after(self.failing_rate, inner_bound_item.timestamp, item.timestamp)
 
         async def _calc_waiting_async() -> int:
             nonlocal bound_item

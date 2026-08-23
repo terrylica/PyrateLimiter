@@ -1,11 +1,15 @@
 # flake8: noqa
 from ._version import __version__ as __version__
 from .abstracts import AbstractBucket as AbstractBucket
+from .abstracts import Algorithm as Algorithm
 from .abstracts import BucketAsyncWrapper as BucketAsyncWrapper
 from .abstracts import BucketFactory as BucketFactory
+from .abstracts import Decision as Decision
 from .abstracts import Duration as Duration
+from .abstracts import LogAlgorithm as LogAlgorithm
 from .abstracts import Rate as Rate
 from .abstracts import RateItem as RateItem
+from .abstracts import SlidingWindowLog as SlidingWindowLog
 from .buckets import InMemoryBucket as InMemoryBucket
 from .buckets import MultiprocessBucket as MultiprocessBucket
 from .buckets import PgQueries as PgQueries
@@ -28,11 +32,15 @@ from . import limiter_factory as limiter_factory
 __all__ = [
     "__version__",
     "AbstractBucket",
+    "Algorithm",
     "BucketAsyncWrapper",
     "BucketFactory",
+    "Decision",
     "Duration",
+    "LogAlgorithm",
     "Rate",
     "RateItem",
+    "SlidingWindowLog",
     "InMemoryBucket",
     "MultiprocessBucket",
     "PgQueries",

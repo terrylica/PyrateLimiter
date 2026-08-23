@@ -7,11 +7,17 @@ from time import time_ns
 from typing import TYPE_CHECKING, Awaitable, List, Optional, Tuple, Union
 
 from ..abstracts import AbstractBucket, Rate, RateItem
+from ..abstracts.algorithm import ADMITTED, Decision
 from ..utils import id_generator
 
 if TYPE_CHECKING:
     from redis import Redis
     from redis.asyncio import Redis as AsyncRedis
+
+
+# Sentinels PUT_ITEM returns in place of a blocking timestamp.
+NEVER_FITS = -1  # weight exceeds the rate's limit; nothing can make room
+NO_BLOCKING_ITEM = -2  # window full but no item to wait on; already ready
 
 
 class LuaScript:
@@ -31,7 +37,22 @@ class LuaScript:
         local count = redis.call('ZCOUNT', bucket, now - interval, now)
         local space_available = limit - tonumber(count)
         if space_available < space_required then
-            return i - 1
+            -- Blocking item sits `limit - space_required` places from the newest.
+            -- Denial implies count > rank, so the ZRANGE cannot come back empty;
+            -- -2 keeps that case distinguishable from -1 rather than silently
+            -- reading as "never fits".
+            local rank = limit - space_required
+            local blocking_timestamp = -1
+
+            if rank >= 0 then
+                blocking_timestamp = -2
+                local blocking = redis.call('ZRANGE', bucket, -1 - rank, -1 - rank, 'WITHSCORES')
+                if blocking[2] then
+                    blocking_timestamp = tonumber(blocking[2])
+                end
+            end
+
+            return {i - 1, blocking_timestamp}
         end
     end
 
@@ -53,7 +74,7 @@ class LuaScript:
         redis.call('ZADD', bucket, unpack(batch))
     end
 
-    return -1
+    return {-1, -1}
     """
 
 
@@ -108,7 +129,12 @@ class RedisBucket(AbstractBucket):
 
         return cls(rates, redis, bucket_key, script_hash)
 
-    def _check_and_insert(self, item: RateItem) -> Union[Rate, None, Awaitable[Optional[Rate]]]:
+    def _check_and_insert(self, item: RateItem) -> Union[Decision, Awaitable[Decision]]:
+        """Check-and-insert, returning the full verdict.
+
+        The script returns the blocking timestamp alongside the failing rate, so
+        the wait comes from the same atomic evaluation - no second ZRANGE.
+        """
         keys = [self.bucket_key]
 
         args = [
@@ -120,36 +146,47 @@ class RedisBucket(AbstractBucket):
             *[value for rate in self.rates for value in (rate.interval, rate.limit)],
         ]
 
-        idx = self.redis.evalsha(self.script_hash, len(keys), *keys, *args)
+        reply = self.redis.evalsha(self.script_hash, len(keys), *keys, *args)
 
-        def _handle_sync(returned_idx: int):
-            assert isinstance(returned_idx, int), "Not int"
-            if returned_idx < 0:
-                return None
+        def _handle_sync(returned: List[int]) -> Decision:
+            idx, blocking_timestamp = int(returned[0]), int(returned[1])
 
-            return self.rates[returned_idx]
+            if idx < 0:
+                return ADMITTED
 
-        async def _handle_async(returned_idx: Awaitable[int]):
-            assert isawaitable(returned_idx), "Not corotine"
-            awaited_idx = await returned_idx
-            return _handle_sync(awaited_idx)
+            rate = self.rates[idx]
 
-        return _handle_async(idx) if isawaitable(idx) else _handle_sync(idx)
+            if blocking_timestamp == NEVER_FITS:
+                # waiting() reports -1 and the limiter gives up.
+                return Decision(failing_rate=rate)
+
+            if blocking_timestamp == NO_BLOCKING_ITEM:
+                # Match LogAlgorithm.decide()'s peek_timestamp -> None mapping.
+                return Decision(failing_rate=rate, retry_after_ms=0)
+
+            return Decision(
+                failing_rate=rate,
+                retry_after_ms=self._algorithm.retry_after(rate, blocking_timestamp, item.timestamp),
+            )
+
+        async def _handle_async(pending: Awaitable[List[int]]) -> Decision:
+            return _handle_sync(await pending)
+
+        return _handle_async(reply) if isawaitable(reply) else _handle_sync(reply)
 
     def put(self, item: RateItem) -> Union[bool, Awaitable[bool]]:
         """Add item to key"""
-        failing_rate = self._check_and_insert(item)
-        if isawaitable(failing_rate):
+        decision = self._check_and_insert(item)
+
+        if isawaitable(decision):
 
             async def _handle_async():
-                self.failing_rate = await failing_rate
-                return not bool(self.failing_rate)
+                return self._record(item, await decision)
 
             return _handle_async()
 
-        assert isinstance(failing_rate, Rate) or failing_rate is None
-        self.failing_rate = failing_rate
-        return not bool(self.failing_rate)
+        assert isinstance(decision, Decision)
+        return self._record(item, decision)
 
     def leak(self, current_timestamp: Optional[int] = None) -> Union[int, Awaitable[int]]:
         assert current_timestamp is not None
@@ -161,6 +198,7 @@ class RedisBucket(AbstractBucket):
 
     def flush(self):
         self.failing_rate = None
+        self._last_wait = None
         return self.redis.delete(self.bucket_key)
 
     def count(self):

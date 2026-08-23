@@ -121,9 +121,15 @@ class SQLiteBucket(AbstractBucket):
                 assert interval == rate.interval
                 counts.append(count)
 
-            decision = self._algorithm.admit(self.rates, counts, item.weight)
-            if not decision.allowed:
-                self.failing_rate = decision.failing_rate
+            decision = self._algorithm.decide(
+                self.rates,
+                counts,
+                item.weight,
+                item.timestamp,
+                self._peek_timestamp,
+            )
+
+            if not self._record(item, decision):
                 return False
 
             # Bind name + timestamp as parameters; never interpolate the
@@ -133,6 +139,18 @@ class SQLiteBucket(AbstractBucket):
             self.conn.executemany(query, rows).close()
             self.conn.commit()
             return True
+
+    def _peek_timestamp(self, offset: int) -> Optional[int]:
+        """Timestamp ``offset`` places from the newest item, or ``None``.
+
+        Called from inside put()'s lock hold, so the Leaker cannot delete rows
+        between the verdict and the wait.
+        """
+        cur = self.conn.execute(Queries.PEEK.format(table=self.table, count=offset))
+        row = cur.fetchone()
+        cur.close()
+
+        return None if row is None else int(row[1])
 
     def leak(self, current_timestamp: Optional[int] = None) -> int:
         """Leaking/clean up bucket"""
@@ -160,6 +178,7 @@ class SQLiteBucket(AbstractBucket):
             self.conn.execute(Queries.FLUSH.format(table=self.table)).close()
             self.conn.commit()
             self.failing_rate = None
+            self._last_wait = None
 
     def count(self) -> int:
         with self.lock:

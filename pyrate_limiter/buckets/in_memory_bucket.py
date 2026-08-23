@@ -5,6 +5,7 @@ from operator import attrgetter
 from threading import RLock
 from typing import List, Optional
 
+from ..abstracts.algorithm import ADMITTED, Decision
 from ..abstracts.bucket import AbstractBucket
 from ..abstracts.rate import Rate, RateItem
 
@@ -39,7 +40,8 @@ class InMemoryBucket(AbstractBucket):
 
     def put(self, item: RateItem) -> bool:
         if item.weight == 0:
-            return True
+            with self._lock:
+                return self._record(item, ADMITTED)
 
         with self._lock:
             # In-memory native implementation of the SlidingWindowLog policy
@@ -62,10 +64,22 @@ class InMemoryBucket(AbstractBucket):
                 space_available = rate.limit - count_existing_items
 
                 if space_available < item.weight:
-                    self.failing_rate = rate
-                    return False
+                    # The blocking item is a fixed offset from the newest, so
+                    # the wait falls out of the bisect already done here.
+                    offset = self._algorithm.blocking_offset(rate, item.weight)
+                    blocking_idx = current_length - 1 - offset
+                    retry_after = None
 
-            self.failing_rate = None
+                    if 0 <= blocking_idx < current_length:
+                        retry_after = self._algorithm.retry_after(
+                            rate,
+                            self.items[blocking_idx].timestamp,
+                            item.timestamp,
+                        )
+
+                    return self._record(item, Decision(failing_rate=rate, retry_after_ms=retry_after))
+
+            self._record(item, ADMITTED)
 
             if item.weight > 1:
                 self.items.extend([item for _ in range(item.weight)])
@@ -97,6 +111,7 @@ class InMemoryBucket(AbstractBucket):
     def flush(self) -> None:
         with self._lock:
             self.failing_rate = None
+            self._last_wait = None
             del self.items[:]
 
     def count(self) -> int:
