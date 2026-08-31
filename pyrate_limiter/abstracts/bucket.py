@@ -430,6 +430,8 @@ class BucketFactory(ABC):
                 logger.debug("Exception %s (%s) deleting bucket %r", type(e).__name__, e, bucket)
 
     def close(self) -> None:
+        buckets = self.get_buckets()
+
         try:
             if self._leaker is not None:
                 self._leaker.close()
@@ -437,7 +439,7 @@ class BucketFactory(ABC):
         except Exception as e:
             logger.info("Exception %s (%s) deleting bucket %r", type(e).__name__, e, self._leaker)
 
-        for bucket in self.get_buckets():
+        for bucket in buckets:
             try:
                 logger.debug("Closing bucket %s", bucket)
                 bucket.close()

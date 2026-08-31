@@ -14,6 +14,29 @@ async def test_multiple_bucket_closes(
 
 
 @pytest.mark.asyncio
+async def test_limiter_close_closes_its_buckets(
+    create_bucket,
+):
+    # Makes sure closing the limiter closes the buckets it owns
+
+    bucket = await create_bucket(DEFAULT_RATES)
+
+    calls = []
+    real_close = bucket.close
+
+    def spy():
+        calls.append(bucket)
+        real_close()
+
+    bucket.close = spy
+
+    limiter = Limiter(bucket)
+    limiter.close()
+
+    assert calls, "Limiter.close() must close the buckets it owns"
+
+
+@pytest.mark.asyncio
 async def test_multiple_bucket_closes_limiter(
     create_bucket,
 ):
