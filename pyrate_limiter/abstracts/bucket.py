@@ -429,8 +429,18 @@ class BucketFactory(ABC):
             except Exception as e:
                 logger.debug("Exception %s (%s) deleting bucket %r", type(e).__name__, e, bucket)
 
+    def owned_buckets(self) -> List[AbstractBucket]:
+        """Buckets this factory is responsible for releasing on ``close()``.
+
+        Deliberately distinct from ``get_buckets()``, which reports what the
+        Leaker currently tracks. A bucket can be owned and in use while absent
+        from that registry and it still needs closing. Subclasses that retain
+        buckets of their own should extend this.
+        """
+        return self.get_buckets()
+
     def close(self) -> None:
-        buckets = self.get_buckets()
+        buckets = self.owned_buckets()
 
         try:
             if self._leaker is not None:

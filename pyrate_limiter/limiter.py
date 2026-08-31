@@ -58,6 +58,18 @@ class SingleBucketFactory(BucketFactory):
     def get(self, _: RateItem) -> AbstractBucket:
         return self.bucket
 
+    def owned_buckets(self) -> List[AbstractBucket]:
+        """This factory holds ``self.bucket`` for its whole life, so it must be
+        closed even when it was never registered for leaking
+        (``schedule_leak=False``) or has since been disposed.
+        """
+        buckets = super().owned_buckets()
+
+        if all(bucket is not self.bucket for bucket in buckets):
+            buckets.append(self.bucket)
+
+        return buckets
+
 
 @contextmanager
 def combined_lock(locks: Union[Iterable[LockLike], RLock], blocking: bool, timeout: int | float = -1):
